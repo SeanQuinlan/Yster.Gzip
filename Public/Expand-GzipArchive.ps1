@@ -1,0 +1,153 @@
+function Expand-GzipArchive {
+    <#
+    .SYNOPSIS
+        Uncompresses a Gzipped file.
+    .DESCRIPTION
+        Uncompresses a Gzipped file to the specified directory. If no destination directory is specified, extract to the same folder as the source.
+    .EXAMPLE
+        Expand-GzipArchive -Path C:\Temp\File.txt.gz
+    .EXAMPLE
+        Expand-GzipArchive -Path C:\Temp\File.txt.gz -DestinationPath C:\Windows\Temp -Force
+    .EXAMPLE
+        @('C:\Temp\File1.txt.gz','C:\Temp\Archive*.log.gz') | Expand-GzipArchive
+    .INPUTS
+        [String[]]
+        A list of paths to Gzipped files that will be expanded.
+    .NOTES
+        Author: Sean Quinlan
+        Email: sean@yster.org
+    #>
+
+    [CmdletBinding()]
+    param(
+        # Specifies the path to the file or files that you want to expand. Wildcards are allowed.
+        [Parameter(
+            Mandatory = $true,
+            ValueFromPipeline = $true,
+            ValueFromPipelineByPropertyName = $true
+        )]
+        [ValidateNotNullOrEmpty()]
+        [String[]]
+        $Path,
+
+        # Specifies the folder that the expanded file will be output to. If omitted, will default to same folder as the source.
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $DestinationPath,
+
+        # Overwrite any files in the DestinationPath if they already exist.
+        [Switch]
+        $Force
+    )
+
+    begin {
+        Write-Verbose ('Function: {0} [begin]' -f (Get-Variable MyInvocation -Scope 0).Value.MyCommand.Name)
+        $PSBoundParameters.GetEnumerator() | ForEach-Object { Write-Verbose ('- Arguments: {0} - {1}' -f $_.Key,($_.Value -join ' ')) }
+
+        if ($PSBoundParameters.ContainsKey('DestinationPath')) {
+            $DestinationPath = Resolve-DestinationPath -Path $DestinationPath
+        }
+
+        $Input_Paths = New-Object -TypeName System.Collections.ArrayList
+        $Gzip_Extensions = @('gz','gzip')
+    }
+
+    process {
+        Write-Verbose ('Function: {0} [process]' -f (Get-Variable MyInvocation -Scope 0).Value.MyCommand.Name)
+
+        if (-not $PSBoundParameters.ContainsKey('Path')) {
+            $Path = $_
+        }
+
+        Write-Verbose ('Validating paths...')
+        $Path | ForEach-Object {
+            $Resolved_Path = $_ | Resolve-Path
+            if (-not $Resolved_Path) {
+                Write-Error ('Path "{0}" resolves to an empty set' -f $_)
+            } else {
+                $Resolved_Path | ForEach-Object {
+                    if ([System.IO.File]::Exists($_)) {
+                        $Resolved_Path_Extension = [System.IO.Path]::GetExtension($_).TrimStart('.')
+                        if ($Gzip_Extensions -notcontains $Resolved_Path_Extension) {
+                            Write-Error ('File does not have a supported extension ({0}): {1}' -f ($Gzip_Extensions -join ','),$_) -ErrorAction 'Stop'
+                        } else {
+                            Write-Verbose ('- Adding path: {0}' -f $_)
+                            [void]$Input_Paths.Add($_.ProviderPath)
+                        }
+                    } else {
+                        Write-Error ('Cannot find file "{0}" because it does not exist' -f $_) -ErrorAction 'Stop'
+                    }
+                }
+            }
+        }
+        Write-Verbose ('Finished validating paths')
+
+        foreach ($Input_Path in $Input_Paths) {
+            Write-Verbose ('Expanding Gzip file: {0}' -f $Input_Path)
+            if ($DestinationPath -eq [String]::Empty) { $DestinationPath = Split-Path -Path $Input_Path -Parent }
+
+            $Input_File = Split-Path -Path $Input_Path -Leaf
+            $Gzip_Extensions | ForEach-Object {
+                if ($Input_File -match ".$($_)$") { $Output_File = $Input_File -replace ".$($_)$" }
+            }
+            $Output_Path = Join-Path -Path $DestinationPath -ChildPath $Output_File
+
+            if ((Test-Path -Path $Output_Path) -and (-not $Force)) {
+                Write-Error ('Destination file "{0}" already exists. Use -Force in order to overwrite existing files.' -f $Output_Path)
+                continue
+            }
+
+            try {
+                # From: https://docs.microsoft.com/en-us/dotnet/api/system.io.filestream.-ctor?view=netframework-4.7.2
+                $Input_FileStream_Args = @(
+                    $Input_Path                 # Path to archive file
+                    [IO.FileMode]::Open         # FileMode
+                    [IO.FileAccess]::Read       # FileAccess
+                )
+                $Input_FileStream = New-Object -TypeName System.IO.FileStream -ArgumentList $Input_FileStream_Args
+                $Ouput_FileStream_Args = @(
+                    $Output_Path                # Path to expanded file
+                    [IO.FileMode]::Create       # FileMode
+                    [IO.FileAccess]::Write      # FileAccess
+                )
+                $Output_FileStream = New-Object -TypeName System.IO.FileStream -ArgumentList $Ouput_FileStream_Args
+                # From: https://docs.microsoft.com/en-us/dotnet/api/system.io.compression.gzipstream?view=netframework-4.7.2
+                $Gzip_Decompress_Stream_Args = @(
+                    $Input_FileStream                               # Stream
+                    [IO.Compression.CompressionMode]::Decompress    # CompressionMode
+                )
+                $Gzip_Decompress_Stream = New-Object -TypeName System.IO.Compression.GZipStream -ArgumentList $Gzip_Decompress_Stream_Args
+
+                try {
+                    Write-Verbose ('Starting gzip decompress stream')
+                    $Buffer_Size = 1024
+                    $Buffer = New-Object Byte[] $Buffer_Size
+
+                    while ($Bytes_Read = $Gzip_Decompress_Stream.Read($Buffer,0,$Buffer_Size)) {
+                        $Output_FileStream.Write($Buffer,0,$Bytes_Read)
+                        $Output_FileStream.Flush()
+                    }
+                    Write-Verbose ('Completed gzip decompress stream. File expanded to: {0}' -f $Output_Path)
+                }
+                catch {
+                    $PSCmdlet.ThrowTerminatingError($_)
+                }
+            }
+            finally {
+                Write-Verbose ('Closing Filestream objects')
+                if ($null -ne $Gzip_Decompress_Stream) {
+                    $Gzip_Decompress_Stream.Close()
+                    $Gzip_Decompress_Stream.Dispose()
+                }
+                if ($null -ne $Input_FileStream) {
+                    $Input_FileStream.Close()
+                    $Input_FileStream.Dispose()
+                }
+                if ($null -ne $Output_FileStream) {
+                    $Output_FileStream.Close()
+                    $Output_FileStream.Dispose()
+                }
+            }
+        }
+    }
+}
